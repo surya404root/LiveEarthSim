@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tracking Earth - Precision Control</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; font-family: 'Courier New', monospace; }
+        #input_video { position: absolute; width: 100vw; height: 100vh; object-fit: cover; transform: scaleX(-1); z-index: -1; }
+        #biometric_canvas { position: absolute; width: 100vw; height: 100vh; z-index: 5; transform: scaleX(-1); pointer-events: none; }
+        #three_canvas { position: absolute; top: 0; left: 0; z-index: 10; pointer-events: none; }
+        #status { 
+            position: absolute; top: 20px; left: 20px; z-index: 100;
+            color: #00f0ff; font-weight: bold; font-size: 14px;
+            text-shadow: 0 0 10px #00f0ff; border-left: 3px solid #00f0ff; padding-left: 15px;
+        }
+        #resize_ui {
+            position: absolute; bottom: 40px; right: 20px; z-index: 100;
+            color: #ff3333; font-size: 14px; padding: 8px; border: 1px solid #ff3333; 
+            display: none; background: rgba(0,0,0,0.7); text-shadow: 0 0 10px #ff3333;
+        }
+    </style>
+</head>
+<body>
+    <div id="status">INITIATING ATMOSPHERIC_DRIFT...</div>
+    <div id="resize_ui">MANUAL_SCALE_ACTIVE</div>
+    <video id="input_video" autoplay playsinline></video>
+    <canvas id="biometric_canvas"></canvas>
+    <canvas id="three_canvas"></canvas>
+
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        const status = document.getElementById('status');
+        const resizeUI = document.getElementById('resize_ui');
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('biometric_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+
+        const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || window.innerWidth < 768;
+        let rotationMomentum = 0.0015;
+        let prevHand2X = null;
+        let activeHandLabel = null;
+        let pinchStartTime = null;
+        let isResizeMode = false;
+        let currentScale = isMobile ? 0.45 : 1.0; 
+
+        let targetOpacity = 0;
+        let currentOpacity = 0;
+
+        let smoothedPos = new THREE.Vector3(0, 0, 0);
+        let fistHoldTimer = null;
+        let isFistReady = false;
+        let burstProgress = 0; 
+        const BURST_DURATION = 2000; 
+
+        const EARTH_URL = "https://earth.google.com/web/@-48.64301928,-14.31233867,-21725.72900461a,49351592.11928844d,35y,78.17231562h,0t,0r/data=CgRCAggBOgMKATBCAggASg0I____________ARAA?authuser=0";
+
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ 
+            canvas: document.getElementById('three_canvas'),
+            antialias: true, alpha: true
+        });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+        const vFOV = (camera.fov * Math.PI) / 180;
+        const visibleHeight = 2 * Math.tan(vFOV / 2) * 10;
+        const visibleWidth = visibleHeight * camera.aspect;
+
+        const earthGroup = new THREE.Group();
+        earthGroup.scale.setScalar(currentScale);
+        scene.add(earthGroup);
+
+        const loader = new THREE.TextureLoader();
+        const textureAnisotropy = renderer.capabilities.getMaxAnisotropy();
+
+        const loadTexture = (url) => {
+            const tex = loader.load(url);
+            tex.anisotropy = textureAnisotropy;
+            return tex;
+        };
+
+        const earthMat = new THREE.MeshPhongMaterial({ 
+            map: loadTexture('https://threejs.org/examples/textures/planets/earth_atmos_2048.jpg'),
+            specularMap: loadTexture('https://threejs.org/examples/textures/planets/earth_specular_2048.jpg'),
+            bumpMap: loadTexture('https://threejs.org/examples/textures/planets/earth_normal_2048.jpg'),
+            bumpScale: 0.12, 
+            shininess: 150,
+            specular: new THREE.Color(0x2244ff),
+            transparent: true,
+            opacity: 0
+        });
+
+        const earth = new THREE.Mesh(new THREE.SphereGeometry(2.3, 128, 128), earthMat);
+        earthGroup.add(earth);
+
+        const cloudMat = new THREE.MeshPhongMaterial({ 
+            map: loadTexture('https://threejs.org/examples/textures/planets/earth_clouds_1024.png'), 
+            transparent: true, 
+            opacity: 0,
+            blending: THREE.AdditiveBlending
+        });
+        const clouds = new THREE.Mesh(new THREE.SphereGeometry(2.35, 128, 128), cloudMat);
+        earthGroup.add(clouds);
+
+        scene.add(new THREE.AmbientLight(0x333333, 1.0));
+        const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+        sun.position.set(5, 2, 5); 
+        scene.add(sun);
+        camera.position.z = 10;
+
+        function drawCyberHand(ctx, landmarks, isH1) {
+            ctx.shadowBlur = 10;
+            ctx.shadowColor = "#00f0ff";
+            ctx.beginPath();
+            ctx.strokeStyle = "rgba(0, 240, 255, 0.4)";
+            ctx.lineWidth = 1;
+            HAND_CONNECTIONS.forEach(([a, b]) => {
+                ctx.moveTo(landmarks[a].x * canvasElement.width, landmarks[a].y * canvasElement.height);
+                ctx.lineTo(landmarks[b].x * canvasElement.width, landmarks[b].y * canvasElement.height);
+            });
+            ctx.stroke();
+
+            landmarks.forEach((pt, i) => {
+                const x = pt.x * canvasElement.width;
+                const y = pt.y * canvasElement.height;
+                if ([4, 8, 12, 16, 20].includes(i)) {
+                    ctx.strokeStyle = "#00f0ff";
+                    ctx.strokeRect(x - 5, y - 5, 10, 10);
+                } else {
+                    ctx.fillStyle = "#fff";
+                    ctx.fillRect(x - 2, y - 2, 4, 4);
+                }
+            });
+
+            const wrist = landmarks[0];
+            const wx = wrist.x * canvasElement.width;
+            const wy = wrist.y * canvasElement.height;
+
+            if (isH1 && burstProgress > 0) {
+                ctx.beginPath();
+                ctx.arc(wx, wy, 45, -Math.PI/2, (-Math.PI/2) + (Math.PI * 2 * burstProgress));
+                ctx.lineWidth = 4;
+                ctx.strokeStyle = "#00f0ff";
+                ctx.stroke();
+            }
+
+            ctx.beginPath();
+            ctx.arc(wx, wy, 40, 0, Math.PI * 2);
+            ctx.setLineDash([5, 15]);
+            ctx.strokeStyle = "rgba(0, 240, 255, 0.6)";
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            ctx.fillStyle = "#00f0ff";
+            ctx.font = "10px 'Courier New'";
+            ctx.fillText(`BIO_TRACK_ACTIVE`, wx + 50, wy - 20);
+            ctx.shadowBlur = 0;
+        }
+
+        function onResults(results) {
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                let h1 = null, h2 = null;
+                targetOpacity = 1.0; 
+
+                results.multiHandLandmarks.forEach((landmarks, index) => {
+                    const label = results.multiHandedness[index].label;
+                    const isH1 = (activeHandLabel === null || label === activeHandLabel);
+                    drawCyberHand(canvasCtx, landmarks, isH1);
+
+                    if (isH1) {
+                        h1 = landmarks;
+                        activeHandLabel = label;
+                    } else {
+                        h2 = landmarks;
+                    }
+                });
+
+                if (h1) {
+                    const palmCenter = h1[9]; 
+
+                    const isFist = h1[8].y > h1[6].y && h1[12].y > h1[10].y && h1[16].y > h1[14].y && h1[20].y > h1[18].y;
+                    const isPalmOpen = h1[8].y < h1[6].y && h1[12].y < h1[10].y && h1[16].y < h1[14].y && h1[20].y < h1[18].y;
+
+                    if (isFist) { 
+                        if (!fistHoldTimer) fistHoldTimer = Date.now();
+                        burstProgress = Math.min((Date.now() - fistHoldTimer) / BURST_DURATION, 1);
+
+                        if (burstProgress >= 1) {
+                            isFistReady = true;
+                            status.innerText = "BIO_SYNC: READY_TO_BURST (OPEN HAND NOW)";
+                        } else {
+                            status.innerText = "BIO_SYNC: CHARGING_REDIRECT...";
+                        }
+                    } else if (isPalmOpen && isFistReady) {
+                        status.innerText = "BIO_SYNC: BURSTING_REDIRECT!";
+                        window.open(EARTH_URL, '_blank');
+                        isFistReady = false;
+                        fistHoldTimer = null;
+                        burstProgress = 0;
+                    } else {
+                        if (!isFistReady) {
+                            fistHoldTimer = null;
+                            burstProgress = 0;
+                            status.innerText = "BIO_LINK: STABLE";
+                        }
+                    }
+
+                    const tx = (palmCenter.x - 0.5) * -visibleWidth;
+                    const ty = (palmCenter.y - 0.5) * -visibleHeight;
+                    const yOffset = isMobile ? 3.5 : 3.0;
+
+                    const targetPos = new THREE.Vector3(tx, ty + yOffset, 0);
+                    if (earthGroup.position.distanceTo(targetPos) > 10) earthGroup.position.copy(targetPos);
+                    earthGroup.position.lerp(targetPos, 0.15);
+                }
+
+                if (h2) {
+                    const thumbTip = h2[4], indexTip = h2[8], mid2 = h2[9];
+                    const rawDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
+
+                    const othersExtended = h2[12].y < h2[10].y && h2[16].y < h2[14].y && h2[20].y < h2[18].y;
+
+                    if (rawDist < 0.04 && othersExtended) {
+                        if (pinchStartTime === null) pinchStartTime = Date.now();
+                        if (Date.now() - pinchStartTime > 800) {
+                            isResizeMode = true;
+                            resizeUI.style.display = 'block';
+                        }
+                    } else if (!isResizeMode) pinchStartTime = null;
+
+                    if (isResizeMode) {
+                        currentScale = THREE.MathUtils.lerp(currentScale, rawDist * 10.0, 0.05);
+                        earthGroup.scale.setScalar(THREE.MathUtils.clamp(currentScale, 0.1, 4.0));
+                    } else {
+                        const curX = mid2.x;
+                        if (prevHand2X !== null) {
+                            const deltaX = curX - prevHand2X;
+                            if (Math.abs(deltaX) > 0.005) rotationMomentum += deltaX * 0.4;
+                        }
+                        prevHand2X = curX;
+                    }
+                } else {
+                    isResizeMode = false;
+                    pinchStartTime = null;
+                    resizeUI.style.display = 'none';
+                    prevHand2X = null;
+                    const targetScale = isMobile ? 0.45 : 1.0;
+                    earthGroup.scale.lerp(new THREE.Vector3(targetScale, targetScale, targetScale), 0.05);
+                }
+            } else {
+                targetOpacity = 0; 
+                activeHandLabel = null;
+                fistHoldTimer = null;
+                burstProgress = 0;
+                isFistReady = false;
+                status.innerText = "SYS_SCANNING...";
+            }
+        }
+
+        const hands = new Hands({locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+
+        hands.setOptions({ 
+            maxNumHands: 2, 
+            modelComplexity: 1, 
+            minDetectionConfidence: 0.75, 
+            minTrackingConfidence: 0.8 
+        });
+        hands.onResults(onResults);
+
+        new Camera(videoElement, {
+            onFrame: async () => { 
+                canvasElement.width = videoElement.videoWidth;
+                canvasElement.height = videoElement.videoHeight;
+                await hands.send({image: videoElement}); 
+            }, width: 1280, height: 720
+        }).start();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            currentOpacity = THREE.MathUtils.lerp(currentOpacity, targetOpacity, 0.08);
+            earthMat.opacity = currentOpacity;
+            cloudMat.opacity = currentOpacity * 0.5; 
+            earth.rotation.y += rotationMomentum;
+            clouds.rotation.y += rotationMomentum * 1.15;
+            clouds.rotation.y += 0.0004; 
+            rotationMomentum *= 0.985;
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
