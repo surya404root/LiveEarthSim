@@ -111,4 +111,5 @@ LiveEarthSim/
 ## 👨‍💻 Author:
 
 Made with ❤️ by Surya.
-📌 GitHub: https:/github.com/surya404root
+
+📌 GitHub: https://github.com/surya404root
